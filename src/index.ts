@@ -11,6 +11,7 @@ import {
   ensureSchema,
   searchSimilar,
   searchText,
+  getAllMemories,
   storeMemory,
   forgetMemories,
   countMemories,
@@ -371,8 +372,8 @@ const jarvisMemoryPlugin = {
 
         await ensureDbInitialized(dbUrl);
 
-        // Get ALL user memories - agent should know everything
-        const results = await searchSimilar(userId, await embed('user info'), 50, 0.0);
+        // Get ALL user memories - no limit, no filtering
+        const results = await getAllMemories(userId);
 
         if (results.length === 0) {
           console.log('[jarvis-memory] PRE: No memories found');

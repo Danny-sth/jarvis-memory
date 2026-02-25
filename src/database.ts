@@ -132,6 +132,22 @@ export async function searchSimilar(
 }
 
 /**
+ * Get ALL memories for a user (no filtering, no limit)
+ */
+export async function getAllMemories(userId: string): Promise<MemoryEntry[]> {
+  const db = getDb();
+
+  return await db<MemoryEntry[]>`
+    SELECT
+      id, user_id, content, importance, memory_type,
+      metadata, access_count, last_accessed_at, created_at, updated_at
+    FROM jarvis_memory
+    WHERE user_id = ${userId}
+    ORDER BY importance DESC, created_at DESC
+  `;
+}
+
+/**
  * Full-text search fallback for proper nouns
  */
 export async function searchText(
