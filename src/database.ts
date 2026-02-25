@@ -55,7 +55,8 @@ export async function ensureSchema(): Promise<void> {
 
   await db`CREATE EXTENSION IF NOT EXISTS vector`;
 
-  await db`
+  // Use unsafe for DDL with dynamic dimensions (not user input, safe)
+  await db.unsafe(`
     CREATE TABLE IF NOT EXISTS jarvis_memory (
       id SERIAL PRIMARY KEY,
       user_id VARCHAR(100) NOT NULL,
@@ -69,7 +70,7 @@ export async function ensureSchema(): Promise<void> {
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )
-  `;
+  `);
 
   // Create indexes
   await db`

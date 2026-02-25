@@ -1,6 +1,6 @@
 {
   "name": "jarvis-memory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "OpenClaw plugin for long-term memory with pgvector and local embeddings",
   "type": "module",
   "main": "dist/index.js",
@@ -21,14 +21,13 @@
   "author": "Danny",
   "license": "MIT",
   "openclaw": {
-    "type": "plugin",
-    "tools": [
-      "memory_search",
-      "memory_store",
-      "memory_forget"
-    ]
+    "extensions": ["./dist/index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.26"
   },
   "dependencies": {
+    "@sinclair/typebox": "^0.32.0",
     "@xenova/transformers": "^2.17.0",
     "postgres": "^3.4.4",
     "pgvector": "^0.2.0"

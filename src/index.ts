@@ -4,6 +4,8 @@
  * Long-term memory with pgvector and local embeddings (transformers.js)
  */
 
+import { Type } from "@sinclair/typebox";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   initDatabase,
   ensureSchema,
@@ -14,275 +16,268 @@ import {
   countMemories,
   evictLowest,
   closeDatabase,
-  type SearchResult
 } from './database.js';
-
 import { embed, preloadModel } from './embeddings.js';
 
 // Config
 const MAX_MEMORIES_PER_USER = 1000;
 const MIN_RESULTS_FOR_FALLBACK = 3;
 
-interface PluginConfig {
-  databaseUrl: string;
+const MEMORY_CATEGORIES = ["FACT", "PREFERENCE", "OPINION", "EVENT", "CONTEXT"] as const;
+type MemoryCategory = typeof MEMORY_CATEGORIES[number];
+
+// Plugin config schema
+const configSchema = Type.Object({
+  databaseUrl: Type.String({ description: "PostgreSQL connection URL with pgvector" }),
+});
+
+// Shared state
+let dbInitialized = false;
+
+async function ensureDbInitialized(dbUrl: string) {
+  if (dbInitialized) return;
+
+  initDatabase(dbUrl);
+  await ensureSchema();
+  await preloadModel();
+  console.log('[jarvis-memory] Database and embeddings initialized');
+  dbInitialized = true;
 }
 
-interface ToolContext {
-  userId?: string;
-  channelId?: string;
-}
+const jarvisMemoryPlugin = {
+  id: "jarvis-memory",
+  name: "Jarvis Memory",
+  description: "Long-term memory with pgvector and local embeddings",
+  kind: "memory" as const,
+  configSchema,
 
-/**
- * OpenClaw Plugin Registration
- */
-export default function register(api: any) {
-  const config: PluginConfig = api.config || {};
-  let initialized = false;
+  register(api: OpenClawPluginApi) {
+    // Get config from plugin config
+    const pluginConfig = api.pluginConfig as { databaseUrl?: string } | undefined;
+    const dbUrl = pluginConfig?.databaseUrl || process.env.JARVIS_DATABASE_URL || null;
 
-  // Initialize on first use
-  async function ensureInitialized() {
-    if (initialized) return;
-
-    const dbUrl = config.databaseUrl || process.env.JARVIS_DATABASE_URL;
     if (!dbUrl) {
-      throw new Error('Database URL not configured. Set JARVIS_DATABASE_URL or plugin config.databaseUrl');
+      console.error('[jarvis-memory] WARNING: Database URL not configured!');
+      return;
     }
 
-    initDatabase(dbUrl);
-    await ensureSchema();
-    await preloadModel();
-    console.log('[jarvis-memory] Plugin initialized');
-    initialized = true;
-  }
+    console.log(`[jarvis-memory] Config: databaseUrl=SET`);
 
-  // Register tool: memory_search
-  api.registerTool?.({
-    name: 'memory_search',
-    description: 'Search through long-term memories using semantic similarity. Use this to recall past conversations, facts about the user, preferences, etc.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'The search query - what to look for in memories'
-        },
-        user_id: {
-          type: 'string',
-          description: 'The user ID (typically from Telegram)'
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of results (default: 10)'
-        },
-        threshold: {
-          type: 'number',
-          description: 'Similarity threshold 0-1 (default: 0.7)'
-        }
-      },
-      required: ['query', 'user_id']
-    },
-    handler: async (params: { query: string; user_id: string; limit?: number; threshold?: number }, ctx: ToolContext) => {
-      try {
-        await ensureInitialized();
-        const { query, user_id, limit = 10, threshold = 0.7 } = params;
-
-        // Generate embedding for query
-        const queryEmbedding = await embed(query);
-
-        // Search similar memories
-        let results = await searchSimilar(user_id, queryEmbedding, limit, threshold);
-
-        // Fallback to text search for proper nouns if few results
-        if (results.length < MIN_RESULTS_FOR_FALLBACK && query.split(' ').length <= 3) {
-          const textResults = await searchText(user_id, query, limit);
-          const seenIds = new Set(results.map(r => r.id));
-
-          for (const tr of textResults) {
-            if (!seenIds.has(tr.id)) {
-              results.push({ ...tr, similarity: 0.5 });
-              seenIds.add(tr.id);
-            }
-          }
-        }
-
-        // Format results
-        const memories = results.map(r => ({
-          id: r.id,
-          content: r.content,
-          importance: r.importance,
-          type: r.memory_type,
-          similarity: r.similarity,
-          created_at: r.created_at
-        }));
-
-        return {
-          success: true,
-          data: {
-            query,
-            count: memories.length,
-            memories
-          }
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-  });
-
-  // Register tool: memory_store
-  api.registerTool?.({
-    name: 'memory_store',
-    description: 'Store a new memory about the user. Use this to remember important facts, preferences, events, or any information worth keeping.',
-    parameters: {
-      type: 'object',
-      properties: {
-        content: {
-          type: 'string',
-          description: 'The memory content to store'
-        },
-        user_id: {
-          type: 'string',
-          description: 'The user ID (typically from Telegram)'
-        },
-        importance: {
-          type: 'number',
-          description: 'Importance score 0-1 (default: 0.5). Higher = less likely to be forgotten'
-        },
-        memory_type: {
-          type: 'string',
-          enum: ['FACT', 'PREFERENCE', 'OPINION', 'EVENT', 'CONTEXT'],
-          description: 'Type of memory (default: FACT)'
-        },
-        metadata: {
-          type: 'object',
-          description: 'Additional metadata to store with the memory'
-        }
-      },
-      required: ['content', 'user_id']
-    },
-    handler: async (params: { content: string; user_id: string; importance?: number; memory_type?: string; metadata?: Record<string, unknown> }, ctx: ToolContext) => {
-      try {
-        await ensureInitialized();
-        const {
-          content,
-          user_id,
-          importance = 0.5,
-          memory_type = 'FACT',
-          metadata = {}
-        } = params;
-
-        // Check memory limit
-        const currentCount = await countMemories(user_id);
-        if (currentCount >= MAX_MEMORIES_PER_USER) {
-          await evictLowest(user_id, 1);
-        }
-
-        // Generate embedding
-        const embedding = await embed(content);
-
-        // Store memory
-        const id = await storeMemory(
-          user_id,
-          content,
-          embedding,
-          importance,
-          memory_type,
-          metadata
-        );
-
-        return {
-          success: true,
-          data: {
-            id,
-            message: 'Memory stored successfully'
-          }
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-  });
-
-  // Register tool: memory_forget
-  api.registerTool?.({
-    name: 'memory_forget',
-    description: 'Delete memories. Can delete specific memories matching a query or all memories for a user.',
-    parameters: {
-      type: 'object',
-      properties: {
-        user_id: {
-          type: 'string',
-          description: 'The user ID'
-        },
-        query: {
-          type: 'string',
-          description: 'Delete memories containing this text'
-        },
-        forget_all: {
-          type: 'boolean',
-          description: 'If true, delete ALL memories for this user'
-        }
-      },
-      required: ['user_id']
-    },
-    handler: async (params: { user_id: string; query?: string; forget_all?: boolean }, ctx: ToolContext) => {
-      try {
-        await ensureInitialized();
-        const { user_id, query, forget_all = false } = params;
-
-        if (forget_all) {
-          const count = await forgetMemories(user_id);
-          return {
-            success: true,
-            data: {
-              deleted: count,
-              message: `Deleted all ${count} memories`
-            }
+    // Register tool: memory_search
+    api.registerTool(
+      {
+        name: "memory_search",
+        label: "Memory Search",
+        description: "Search through long-term memories using semantic similarity. Use when you need context about user preferences, past decisions, or previously discussed topics.",
+        parameters: Type.Object({
+          query: Type.String({ description: "Search query" }),
+          user_id: Type.String({ description: "User ID (from Telegram, etc.)" }),
+          limit: Type.Optional(Type.Number({ description: "Max results (default: 10)" })),
+          threshold: Type.Optional(Type.Number({ description: "Similarity threshold 0-1 (default: 0.5)" })),
+        }),
+        async execute(_toolCallId: string, params: unknown) {
+          const { query, user_id, limit = 10, threshold = 0.5 } = params as {
+            query: string;
+            user_id: string;
+            limit?: number;
+            threshold?: number;
           };
-        }
 
-        if (!query) {
-          return {
-            success: false,
-            error: 'Either query or forget_all must be provided'
-          };
-        }
+          try {
+            await ensureDbInitialized(dbUrl);
 
-        const count = await forgetMemories(user_id, query);
+            const queryEmbedding = await embed(query);
+            let results = await searchSimilar(user_id, queryEmbedding, limit, threshold);
 
-        return {
-          success: true,
-          data: {
-            deleted: count,
-            message: `Deleted ${count} memories matching "${query}"`
+            // Fallback to text search for proper nouns if few results
+            if (results.length < MIN_RESULTS_FOR_FALLBACK && query.split(' ').length <= 3) {
+              const textResults = await searchText(user_id, query, limit);
+              const seenIds = new Set(results.map(r => r.id));
+
+              for (const tr of textResults) {
+                if (!seenIds.has(tr.id)) {
+                  results.push({ ...tr, similarity: 0.5 });
+                  seenIds.add(tr.id);
+                }
+              }
+            }
+
+            if (results.length === 0) {
+              return {
+                content: [{ type: "text", text: "No relevant memories found." }],
+                details: { count: 0 },
+              };
+            }
+
+            const text = results
+              .map((r, i) => `${i + 1}. [${r.memory_type}] ${r.content} (${(r.similarity * 100).toFixed(0)}%)`)
+              .join("\n");
+
+            const sanitizedResults = results.map((r) => ({
+              id: r.id,
+              content: r.content,
+              type: r.memory_type,
+              importance: r.importance,
+              similarity: r.similarity,
+            }));
+
+            return {
+              content: [{ type: "text", text: `Found ${results.length} memories:\n\n${text}` }],
+              details: { count: results.length, memories: sanitizedResults },
+            };
+          } catch (error) {
+            console.error('[jarvis-memory] Search error:', error);
+            return {
+              content: [{ type: "text", text: `Memory search error: ${error instanceof Error ? error.message : String(error)}` }],
+              details: { error: true },
+            };
           }
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-  });
+        },
+      },
+      { name: "memory_search" },
+    );
 
-  // Register cleanup service
-  api.registerService?.({
-    id: 'jarvis-memory-cleanup',
-    start: async () => {
-      console.log('[jarvis-memory] Service started');
-    },
-    stop: async () => {
-      await closeDatabase();
-      console.log('[jarvis-memory] Service stopped');
-    }
-  });
+    // Register tool: memory_store
+    api.registerTool(
+      {
+        name: "memory_store",
+        label: "Memory Store",
+        description: "Save important information in long-term memory. Use for preferences, facts, decisions, events.",
+        parameters: Type.Object({
+          text: Type.String({ description: "Information to remember" }),
+          user_id: Type.String({ description: "User ID (from Telegram, etc.)" }),
+          importance: Type.Optional(Type.Number({ description: "Importance 0-1 (default: 0.7)" })),
+          category: Type.Optional(
+            Type.Unsafe<MemoryCategory>({
+              type: "string",
+              enum: [...MEMORY_CATEGORIES],
+              description: "Memory category (default: FACT)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId: string, params: unknown) {
+          const {
+            text,
+            user_id,
+            importance = 0.7,
+            category = "FACT",
+          } = params as {
+            text: string;
+            user_id: string;
+            importance?: number;
+            category?: MemoryCategory;
+          };
 
-  console.log('[jarvis-memory] Plugin registered');
-}
+          try {
+            await ensureDbInitialized(dbUrl);
+
+            // Check memory limit and evict if needed
+            const currentCount = await countMemories(user_id);
+            if (currentCount >= MAX_MEMORIES_PER_USER) {
+              await evictLowest(user_id, 1);
+            }
+
+            // Generate embedding
+            const embedding = await embed(text);
+
+            // Check for duplicates
+            const existing = await searchSimilar(user_id, embedding, 1, 0.95);
+            if (existing.length > 0) {
+              return {
+                content: [{ type: "text", text: `Similar memory already exists: "${existing[0].content}"` }],
+                details: { action: "duplicate", existingId: existing[0].id },
+              };
+            }
+
+            // Store memory
+            const id = await storeMemory(user_id, text, embedding, importance, category, {});
+
+            console.log(`[jarvis-memory] Stored memory id=${id} for user=${user_id}`);
+
+            return {
+              content: [{ type: "text", text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? '...' : ''}"` }],
+              details: { action: "created", id },
+            };
+          } catch (error) {
+            console.error('[jarvis-memory] Store error:', error);
+            return {
+              content: [{ type: "text", text: `Memory store error: ${error instanceof Error ? error.message : String(error)}` }],
+              details: { error: true },
+            };
+          }
+        },
+      },
+      { name: "memory_store" },
+    );
+
+    // Register tool: memory_forget
+    api.registerTool(
+      {
+        name: "memory_forget",
+        label: "Memory Forget",
+        description: "Delete specific memories. GDPR-compliant.",
+        parameters: Type.Object({
+          user_id: Type.String({ description: "User ID" }),
+          query: Type.Optional(Type.String({ description: "Search to find memory to delete" })),
+          forget_all: Type.Optional(Type.Boolean({ description: "Delete ALL memories for user" })),
+        }),
+        async execute(_toolCallId: string, params: unknown) {
+          const { user_id, query, forget_all } = params as {
+            user_id: string;
+            query?: string;
+            forget_all?: boolean;
+          };
+
+          try {
+            await ensureDbInitialized(dbUrl);
+
+            if (forget_all) {
+              const count = await forgetMemories(user_id);
+              return {
+                content: [{ type: "text", text: `Deleted all ${count} memories for user.` }],
+                details: { action: "deleted_all", count },
+              };
+            }
+
+            if (query) {
+              const count = await forgetMemories(user_id, query);
+              return {
+                content: [{ type: "text", text: `Deleted ${count} memories matching "${query}"` }],
+                details: { action: "deleted", count },
+              };
+            }
+
+            return {
+              content: [{ type: "text", text: "Provide query or forget_all=true." }],
+              details: { error: "missing_param" },
+            };
+          } catch (error) {
+            console.error('[jarvis-memory] Forget error:', error);
+            return {
+              content: [{ type: "text", text: `Memory forget error: ${error instanceof Error ? error.message : String(error)}` }],
+              details: { error: true },
+            };
+          }
+        },
+      },
+      { name: "memory_forget" },
+    );
+
+    // Register service for cleanup
+    api.registerService({
+      id: "jarvis-memory-cleanup",
+      async start() {
+        console.log("[jarvis-memory] Service started");
+      },
+      async stop() {
+        await closeDatabase();
+        dbInitialized = false;
+        console.log("[jarvis-memory] Service stopped");
+      },
+    });
+
+    console.log("[jarvis-memory] Plugin registered");
+  },
+};
+
+export default jarvisMemoryPlugin;
