@@ -16,6 +16,7 @@ import {
   forgetMemories,
   countMemories,
   evictLowest,
+  decayMemories,
   closeDatabase,
 } from './database.js';
 import { embed, preloadModel } from './embeddings.js';
@@ -272,6 +273,14 @@ const jarvisMemoryPlugin = {
       id: "jarvis-memory-cleanup",
       async start() {
         console.log("[jarvis-memory] Service started");
+
+        // Run decay on old memories at startup
+        try {
+          await ensureDbInitialized(dbUrl);
+          await decayMemories(7, 0.95, 0.1); // 7 days, 5% decay, min 0.1
+        } catch (error) {
+          console.error('[jarvis-memory] Decay error:', error);
+        }
       },
       async stop() {
         await closeDatabase();
@@ -397,7 +406,107 @@ const jarvisMemoryPlugin = {
       }
     });
 
-    console.log("[jarvis-memory] Plugin registered with message_received + before_prompt_build hooks");
+    // ===========================================
+    // HOOK 3: agent_end - POST-processing
+    // Auto-extract and store facts from conversation
+    // ===========================================
+    api.on('agent_end', async (
+      event: { messages?: unknown[]; success?: boolean; error?: string },
+      ctx: Record<string, unknown>
+    ) => {
+      try {
+        if (!event.success || !event.messages || event.messages.length < 2) {
+          return;
+        }
+
+        // Extract userId from sessionKey
+        const sessionKey = String(ctx.sessionKey || '');
+        const messageProvider = String(ctx.messageProvider || '');
+
+        let userId: string | null = null;
+        if (sessionKey && messageProvider === 'telegram') {
+          const match = sessionKey.match(/:direct:(\d+)$/);
+          if (match) {
+            userId = `telegram:${match[1]}`;
+          }
+        }
+
+        if (!userId) {
+          return; // Can't store without user_id
+        }
+
+        // Get last user message and assistant response
+        const messages = event.messages as Array<{ role?: string; content?: string }>;
+        const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+        const lastAssistantMsg = messages.filter(m => m.role === 'assistant').pop();
+
+        if (!lastUserMsg?.content || !lastAssistantMsg?.content) {
+          return;
+        }
+
+        // Simple fact extraction patterns (Russian)
+        const factPatterns = [
+          /(?:меня зовут|я\s+)([А-Яа-яA-Za-z]+)/i,
+          /(?:мне\s+)(\d+)\s*(?:лет|год)/i,
+          /(?:живу в|из города?)\s+([А-Яа-яA-Za-z\s]+)/i,
+          /(?:люблю|нравится|обожаю)\s+(.+?)(?:\.|,|$)/i,
+          /(?:работаю|я\s+)([А-Яа-яA-Za-z]+(?:ом|ером|истом|ником))/i,
+        ];
+
+        const userText = lastUserMsg.content;
+        const extractedFacts: Array<{ text: string; category: string }> = [];
+
+        // Check for name
+        const nameMatch = userText.match(/меня зовут\s+([А-Яа-яA-Za-z]+)/i);
+        if (nameMatch) {
+          extractedFacts.push({ text: `Имя - ${nameMatch[1]}`, category: 'FACT' });
+        }
+
+        // Check for age
+        const ageMatch = userText.match(/мне\s+(\d+)\s*(?:лет|год)/i);
+        if (ageMatch) {
+          extractedFacts.push({ text: `Возраст - ${ageMatch[1]} лет`, category: 'FACT' });
+        }
+
+        // Check for location
+        const locationMatch = userText.match(/(?:живу в|из города?)\s+([А-Яа-яA-Za-z\s]+?)(?:\.|,|$)/i);
+        if (locationMatch) {
+          extractedFacts.push({ text: `Живет в ${locationMatch[1].trim()}`, category: 'FACT' });
+        }
+
+        // Check for preferences
+        const prefMatch = userText.match(/(?:люблю|нравится|обожаю)\s+(.+?)(?:\.|,|!|$)/i);
+        if (prefMatch && prefMatch[1].length < 100) {
+          extractedFacts.push({ text: `Любит ${prefMatch[1].trim()}`, category: 'PREFERENCE' });
+        }
+
+        if (extractedFacts.length === 0) {
+          return;
+        }
+
+        console.log(`[jarvis-memory] POST: Found ${extractedFacts.length} facts for user=${userId}`);
+
+        await ensureDbInitialized(dbUrl);
+
+        for (const fact of extractedFacts) {
+          const embedding = await embed(fact.text);
+
+          // Check for duplicates
+          const existing = await searchSimilar(userId, embedding, 1, 0.9);
+          if (existing.length > 0) {
+            console.log(`[jarvis-memory] POST: Skip duplicate "${fact.text}"`);
+            continue;
+          }
+
+          await storeMemory(userId, fact.text, embedding, 0.8, fact.category, { source: 'auto_extract' });
+          console.log(`[jarvis-memory] POST: Stored "${fact.text}"`);
+        }
+      } catch (error) {
+        console.error('[jarvis-memory] POST error:', error);
+      }
+    });
+
+    console.log("[jarvis-memory] Plugin registered with PRE + POST hooks");
   },
 };
 

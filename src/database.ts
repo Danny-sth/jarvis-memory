@@ -270,6 +270,32 @@ export async function evictLowest(userId: string, count: number): Promise<number
 }
 
 /**
+ * Decay importance for old, unused memories
+ * Reduces importance by decay factor for memories not accessed in N days
+ */
+export async function decayMemories(
+  daysThreshold: number = 7,
+  decayFactor: number = 0.95,
+  minImportance: number = 0.1
+): Promise<number> {
+  const db = getDb();
+
+  const result = await db`
+    UPDATE jarvis_memory
+    SET importance = GREATEST(importance * ${decayFactor}, ${minImportance}),
+        updated_at = NOW()
+    WHERE last_accessed_at < NOW() - INTERVAL '1 day' * ${daysThreshold}
+      AND importance > ${minImportance}
+  `;
+
+  if (result.count > 0) {
+    console.log(`[jarvis-memory] Decayed ${result.count} old memories`);
+  }
+
+  return result.count;
+}
+
+/**
  * Close database connection
  */
 export async function closeDatabase(): Promise<void> {
