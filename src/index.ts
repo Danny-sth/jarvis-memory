@@ -34,6 +34,9 @@ const configSchema = Type.Object({
 // Shared state
 let dbInitialized = false;
 
+// Session to user mapping (populated by message_received hook)
+const sessionUserMap = new Map<string, { userId: string; channel: string }>();
+
 async function ensureDbInitialized(dbUrl: string) {
   if (dbInitialized) return;
 
@@ -272,77 +275,109 @@ const jarvisMemoryPlugin = {
       async stop() {
         await closeDatabase();
         dbInitialized = false;
+        sessionUserMap.clear();
         console.log("[jarvis-memory] Service stopped");
       },
     });
 
     // ===========================================
-    // AUTOMATIC PRE-PROCESSING (like vtoroy)
-    // Inject memory context BEFORE LLM responds
+    // HOOK 1: message_received - Capture user_id
+    // This is the PROPER way to get sender info
     // ===========================================
-    api.on('before_prompt_build', async (event: { prompt: string; messages?: unknown[] }, ctx: Record<string, unknown>) => {
-      try {
-        // Try multiple ways to get user_id
-        let userId: string | null = null;
+    api.on('message_received', async (
+      event: { from?: string; content?: string; timestamp?: number; metadata?: Record<string, unknown> },
+      ctx: Record<string, unknown>
+    ) => {
+      console.log(`[jarvis-memory] message_received: from=${event.from}, ctx=${JSON.stringify(ctx)}`);
 
-        // Method 1: Direct from context
-        if (ctx.userId) {
-          userId = String(ctx.userId);
+      if (event.from) {
+        const channel = String(ctx.channelId || 'unknown');
+        // event.from may already have prefix (telegram:123) or be raw (123)
+        const userId = event.from.includes(':') ? event.from : `${channel}:${event.from}`;
+
+        // Store with multiple keys for reliable lookup
+        const conversationId = String(ctx.conversationId || '');
+        const sessionId = String(ctx.sessionId || '');
+
+        // Primary key: conversationId (e.g., "telegram:764733417")
+        if (conversationId) {
+          sessionUserMap.set(conversationId, { userId, channel });
+          console.log(`[jarvis-memory] Mapped conversationId=${conversationId} -> user=${userId}`);
         }
-        // Method 2: From session metadata
-        if (!userId && ctx.session && typeof ctx.session === 'object' && (ctx.session as Record<string, unknown>).userId) {
-          userId = String((ctx.session as Record<string, unknown>).userId);
+
+        // Fallback key: sessionId
+        if (sessionId) {
+          sessionUserMap.set(sessionId, { userId, channel });
         }
-        // Method 3: Parse sessionKey for numeric ID (Telegram user ID)
-        if (!userId && ctx.sessionKey) {
-          const sessionKey = String(ctx.sessionKey);
-          const parts = sessionKey.split(':');
-          for (const part of parts) {
-            if (/^\d{6,}$/.test(part)) { // At least 6 digits for Telegram ID
-              userId = `telegram:${part}`;
+
+        // Extra fallback: channel:accountId
+        if (ctx.channelId && ctx.accountId) {
+          const altKey = `${ctx.channelId}:${ctx.accountId}`;
+          sessionUserMap.set(altKey, { userId, channel });
+        }
+      }
+    });
+
+    // ===========================================
+    // HOOK 2: before_prompt_build - Inject memory
+    // Uses user_id captured from message_received
+    // ===========================================
+    api.on('before_prompt_build', async (
+      event: { prompt: string; messages?: unknown[] },
+      ctx: Record<string, unknown>
+    ) => {
+      try {
+        console.log(`[jarvis-memory] PRE ctx=${JSON.stringify(ctx)}`);
+
+        let userId: string | null = null;
+        const sessionKey = String(ctx.sessionKey || '');
+        const messageProvider = String(ctx.messageProvider || '');
+
+        // Method 1: Extract from sessionKey pattern "agent:main:telegram:direct:USER_ID"
+        if (sessionKey && messageProvider === 'telegram') {
+          const match = sessionKey.match(/:direct:(\d+)$/);
+          if (match) {
+            userId = `telegram:${match[1]}`;
+            console.log(`[jarvis-memory] PRE: Extracted userId from sessionKey: ${userId}`);
+          }
+        }
+
+        // Method 2: Try sessionUserMap with various keys
+        if (!userId) {
+          const keysToTry = [
+            ctx.conversationId,
+            ctx.sessionId,
+            // Try to construct conversationId from sessionKey
+            sessionKey.includes(':direct:') ? `telegram:${sessionKey.split(':direct:')[1]}` : null,
+            'default'
+          ].filter(Boolean).map(String);
+
+          for (const key of keysToTry) {
+            if (sessionUserMap.has(key)) {
+              const userInfo = sessionUserMap.get(key)!;
+              userId = userInfo.userId;
+              console.log(`[jarvis-memory] PRE: Got userId from map key=${key}: ${userId}`);
               break;
             }
           }
         }
-        // Method 4: From messageProvider context
-        if (!userId && ctx.from) {
-          userId = `telegram:${ctx.from}`;
-        }
-        // Method 5: FALLBACK - Read from USER.md in workspace (for single-user setup)
-        if (!userId && ctx.workspaceDir) {
-          try {
-            const fs = await import('fs');
-            const path = await import('path');
-            const userMdPath = path.join(String(ctx.workspaceDir), 'USER.md');
-            if (fs.existsSync(userMdPath)) {
-              const userMd = fs.readFileSync(userMdPath, 'utf-8');
-              // Look for Telegram ID in USER.md
-              const telegramMatch = userMd.match(/Telegram\s*(?:ID)?[:\s]*(\d+)/i);
-              if (telegramMatch) {
-                userId = `telegram:${telegramMatch[1]}`;
-              }
-            }
-          } catch (e) {
-            console.log(`[jarvis-memory] PRE: Could not read USER.md: ${e}`);
-          }
-        }
 
         if (!userId) {
-          console.log('[jarvis-memory] PRE: Could not determine userId, skipping');
+          console.log(`[jarvis-memory] PRE: No userId found, sessionKey=${sessionKey}`);
           return;
         }
 
         // Clean prompt from timestamp prefix like "[Wed 2026-02-25 14:00 UTC]"
-        let cleanPrompt = event.prompt.replace(/^\[.*?\]\s*/, '');
+        const cleanPrompt = event.prompt.replace(/^\[.*?\]\s*/, '');
         console.log(`[jarvis-memory] PRE: Searching for user=${userId}, query="${cleanPrompt.slice(0, 50)}..."`);
 
         await ensureDbInitialized(dbUrl);
 
-        // Search for relevant memories (low threshold for better recall)
+        // Search for relevant memories
         const queryEmbedding = await embed(cleanPrompt);
         let results = await searchSimilar(userId, queryEmbedding, 5, 0.2);
 
-        // Fallback to text search for short queries (proper nouns)
+        // Fallback to text search for short queries
         if (results.length < 2 && cleanPrompt.split(' ').length <= 5) {
           const textResults = await searchText(userId, cleanPrompt, 5);
           const seenIds = new Set(results.map(r => r.id));
@@ -372,11 +407,11 @@ const jarvisMemoryPlugin = {
         };
       } catch (error) {
         console.error('[jarvis-memory] PRE error:', error);
-        return; // Don't break the flow on error
+        return;
       }
     });
 
-    console.log("[jarvis-memory] Plugin registered with PRE-processing hook");
+    console.log("[jarvis-memory] Plugin registered with message_received + before_prompt_build hooks");
   },
 };
 
