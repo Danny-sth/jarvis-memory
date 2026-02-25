@@ -276,7 +276,107 @@ const jarvisMemoryPlugin = {
       },
     });
 
-    console.log("[jarvis-memory] Plugin registered");
+    // ===========================================
+    // AUTOMATIC PRE-PROCESSING (like vtoroy)
+    // Inject memory context BEFORE LLM responds
+    // ===========================================
+    api.on('before_prompt_build', async (event: { prompt: string; messages?: unknown[] }, ctx: Record<string, unknown>) => {
+      try {
+        // Try multiple ways to get user_id
+        let userId: string | null = null;
+
+        // Method 1: Direct from context
+        if (ctx.userId) {
+          userId = String(ctx.userId);
+        }
+        // Method 2: From session metadata
+        if (!userId && ctx.session && typeof ctx.session === 'object' && (ctx.session as Record<string, unknown>).userId) {
+          userId = String((ctx.session as Record<string, unknown>).userId);
+        }
+        // Method 3: Parse sessionKey for numeric ID (Telegram user ID)
+        if (!userId && ctx.sessionKey) {
+          const sessionKey = String(ctx.sessionKey);
+          const parts = sessionKey.split(':');
+          for (const part of parts) {
+            if (/^\d{6,}$/.test(part)) { // At least 6 digits for Telegram ID
+              userId = `telegram:${part}`;
+              break;
+            }
+          }
+        }
+        // Method 4: From messageProvider context
+        if (!userId && ctx.from) {
+          userId = `telegram:${ctx.from}`;
+        }
+        // Method 5: FALLBACK - Read from USER.md in workspace (for single-user setup)
+        if (!userId && ctx.workspaceDir) {
+          try {
+            const fs = await import('fs');
+            const path = await import('path');
+            const userMdPath = path.join(String(ctx.workspaceDir), 'USER.md');
+            if (fs.existsSync(userMdPath)) {
+              const userMd = fs.readFileSync(userMdPath, 'utf-8');
+              // Look for Telegram ID in USER.md
+              const telegramMatch = userMd.match(/Telegram\s*(?:ID)?[:\s]*(\d+)/i);
+              if (telegramMatch) {
+                userId = `telegram:${telegramMatch[1]}`;
+              }
+            }
+          } catch (e) {
+            console.log(`[jarvis-memory] PRE: Could not read USER.md: ${e}`);
+          }
+        }
+
+        if (!userId) {
+          console.log('[jarvis-memory] PRE: Could not determine userId, skipping');
+          return;
+        }
+
+        // Clean prompt from timestamp prefix like "[Wed 2026-02-25 14:00 UTC]"
+        let cleanPrompt = event.prompt.replace(/^\[.*?\]\s*/, '');
+        console.log(`[jarvis-memory] PRE: Searching for user=${userId}, query="${cleanPrompt.slice(0, 50)}..."`);
+
+        await ensureDbInitialized(dbUrl);
+
+        // Search for relevant memories (low threshold for better recall)
+        const queryEmbedding = await embed(cleanPrompt);
+        let results = await searchSimilar(userId, queryEmbedding, 5, 0.2);
+
+        // Fallback to text search for short queries (proper nouns)
+        if (results.length < 2 && cleanPrompt.split(' ').length <= 5) {
+          const textResults = await searchText(userId, cleanPrompt, 5);
+          const seenIds = new Set(results.map(r => r.id));
+          for (const tr of textResults) {
+            if (!seenIds.has(tr.id)) {
+              results.push({ ...tr, similarity: 0.5 });
+              seenIds.add(tr.id);
+            }
+          }
+        }
+
+        if (results.length === 0) {
+          console.log('[jarvis-memory] PRE: No relevant memories found');
+          return;
+        }
+
+        // Format memories as context
+        const memoryText = results
+          .map(m => `• [${m.memory_type}] ${m.content} (${(m.similarity * 100).toFixed(0)}%)`)
+          .join('\n');
+
+        console.log(`[jarvis-memory] PRE: Injecting ${results.length} memories`);
+
+        // Return context to be prepended to user's message
+        return {
+          prependContext: `[Система: Релевантная информация из долгосрочной памяти]\n${memoryText}\n\n---\n\n`
+        };
+      } catch (error) {
+        console.error('[jarvis-memory] PRE error:', error);
+        return; // Don't break the flow on error
+      }
+    });
+
+    console.log("[jarvis-memory] Plugin registered with PRE-processing hook");
   },
 };
 
