@@ -367,36 +367,21 @@ const jarvisMemoryPlugin = {
           return;
         }
 
-        // Clean prompt from timestamp prefix like "[Wed 2026-02-25 14:00 UTC]"
-        const cleanPrompt = event.prompt.replace(/^\[.*?\]\s*/, '');
-        console.log(`[jarvis-memory] PRE: Searching for user=${userId}, query="${cleanPrompt.slice(0, 50)}..."`);
+        console.log(`[jarvis-memory] PRE: Loading ALL memories for user=${userId}`);
 
         await ensureDbInitialized(dbUrl);
 
-        // Search for relevant memories
-        const queryEmbedding = await embed(cleanPrompt);
-        let results = await searchSimilar(userId, queryEmbedding, 5, 0.2);
-
-        // Fallback to text search for short queries
-        if (results.length < 2 && cleanPrompt.split(' ').length <= 5) {
-          const textResults = await searchText(userId, cleanPrompt, 5);
-          const seenIds = new Set(results.map(r => r.id));
-          for (const tr of textResults) {
-            if (!seenIds.has(tr.id)) {
-              results.push({ ...tr, similarity: 0.5 });
-              seenIds.add(tr.id);
-            }
-          }
-        }
+        // Get ALL user memories - agent should know everything
+        const results = await searchSimilar(userId, await embed('user info'), 50, 0.0);
 
         if (results.length === 0) {
-          console.log('[jarvis-memory] PRE: No relevant memories found');
+          console.log('[jarvis-memory] PRE: No memories found');
           return;
         }
 
-        // Format memories as context
+        // Format ALL memories as context
         const memoryText = results
-          .map(m => `• [${m.memory_type}] ${m.content} (${(m.similarity * 100).toFixed(0)}%)`)
+          .map(m => `• [${m.memory_type}] ${m.content}`)
           .join('\n');
 
         console.log(`[jarvis-memory] PRE: Injecting ${results.length} memories`);
