@@ -436,7 +436,7 @@ const jarvisMemoryPlugin = {
         }
 
         // Get last user message and assistant response
-        const messages = event.messages as Array<{ role?: string; content?: string }>;
+        const messages = event.messages as Array<{ role?: string; content?: unknown }>;
         const lastUserMsg = messages.filter(m => m.role === 'user').pop();
         const lastAssistantMsg = messages.filter(m => m.role === 'assistant').pop();
 
@@ -444,16 +444,22 @@ const jarvisMemoryPlugin = {
           return;
         }
 
-        // Simple fact extraction patterns (Russian)
-        const factPatterns = [
-          /(?:меня зовут|я\s+)([А-Яа-яA-Za-z]+)/i,
-          /(?:мне\s+)(\d+)\s*(?:лет|год)/i,
-          /(?:живу в|из города?)\s+([А-Яа-яA-Za-z\s]+)/i,
-          /(?:люблю|нравится|обожаю)\s+(.+?)(?:\.|,|$)/i,
-          /(?:работаю|я\s+)([А-Яа-яA-Za-z]+(?:ом|ером|истом|ником))/i,
-        ];
+        // Extract text content (may be string or array of content blocks)
+        const extractText = (content: unknown): string => {
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) {
+            return content
+              .filter((c: { type?: string }) => c.type === 'text')
+              .map((c: { text?: string }) => c.text || '')
+              .join(' ');
+          }
+          return '';
+        };
 
-        const userText = lastUserMsg.content;
+        const userText = extractText(lastUserMsg.content);
+        if (!userText) {
+          return;
+        }
         const extractedFacts: Array<{ text: string; category: string }> = [];
 
         // Check for name
